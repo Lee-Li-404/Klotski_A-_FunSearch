@@ -1,0 +1,439 @@
+import heapq
+import time
+import random
+import os 
+from heuristics import trivial_h, blocking_h, corridor_h, aggressive_h
+from board_state_class import Piece, State, Board
+import sys
+import datetime
+from multiprocessing import Pool, cpu_count
+from tqdm import tqdm   # pip install tqdm
+
+# ----------------------------
+# 预设配置
+# ----------------------------
+configs = [
+    # Hero = (2,2)
+    {"hero": (2,2), "extras": [(1,2,4), (2,1,1), (1,1,4)]},
+    {"hero": (2,2), "extras": [(1,2,3), (2,1,2), (1,1,4)]},
+    {"hero": (2,2), "extras": [(1,2,3), (2,1,2), (1,1,3)]},
+
+    # Hero = (1,2)
+    {"hero": (1,2), "extras": [(2,2,1), (1,2,2), (2,1,2), (1,1,4)]},
+    {"hero": (1,2), "extras": [(1,2,3), (2,1,2), (1,1,6)]},
+
+    # Hero = (2,1)
+    {"hero": (2,1), "extras": [(2,2,1), (1,2,4), (1,1,4)]},
+    {"hero": (2,1), "extras": [(2,2,1), (1,2,3), (2,1,2), (1,1,2)]},
+
+    # Hero = (1,1)
+    {"hero": (1,1), "extras": [(2,2,2), (1,2,2), (2,1,1), (1,1,3)]},
+    {"hero": (1,1), "extras": [(2,2,2), (1,2,1), (2,1,1), (1,1,4)]},
+]
+
+
+# ----------------------------
+# ASCII 渲染
+# ----------------------------
+def render_ascii(board, s, labels=None):
+    grid = [['.' for _ in range(board.W)] for _ in range(board.H)]
+    if labels is None:
+        labels = [chr(ord('A') + i) for i in range(len(s.pieces))]
+    for idx, p in enumerate(s.pieces):
+        ch = labels[idx]
+        for dy in range(p.h):
+            for dx in range(p.w):
+                grid[p.y + dy][p.x + dx] = ch
+    return "\n".join("".join(row) for row in grid)
+
+# ----------------------------
+# A* 搜索
+# ----------------------------
+def astar(board, start, h, max_steps=10**6, log_html_path=None):
+    t0 = time.time()
+    open_heap = []  # (f, g, id, State)
+    g_cost = {start: 0}
+    parent = {start: None}
+
+    counter = 0
+    f0 = h(start, board)
+    heapq.heappush(open_heap, (f0, 0, counter, start))
+
+    expanded = 0
+    goal_state = None
+
+    while open_heap and expanded < max_steps:
+        f, g, _, s = heapq.heappop(open_heap)
+        expanded += 1
+        # if (expanded % 10000 == 0):
+        #     print(expanded)
+        # ✅ log only expanded node
+
+        if board.is_goal(s):
+            goal_state = s
+            break
+
+        for nb in board.neighbors(s):
+            ng = g + 1
+            if nb not in g_cost or ng < g_cost[nb]:
+                g_cost[nb] = ng
+                parent[nb] = s
+                fnb = ng + h(nb, board)
+                counter += 1
+                heapq.heappush(open_heap, (fnb, ng, counter, nb))
+                # ❌ no logger.add_or_get here anymore
+
+    # reconstruct path if any
+    path, cost = None, None
+    if goal_state is not None:
+        path = []
+        cur = goal_state
+        while cur is not None:
+            path.append(cur)
+            cur = parent[cur]
+        path.reverse()
+        cost = len(path) - 1
+
+    result = {
+        "path": path,
+        "cost": cost,
+        "expanded": expanded,
+        "time": time.time() - t0
+    }
+
+    return result
+
+def random_goal_with_blocks(W=4, H=5, hero_size=(2,2), extra_shapes=[(1,2,2),(1,1,2)]):
+    # hero 固定在底部出口（默认居中）
+    gx = (W - hero_size[0]) // 2
+    gy = H - hero_size[1]
+    hero = Piece(hero_size[0], hero_size[1], gx, gy)
+
+    pieces = [hero]
+    occupied = [[False]*W for _ in range(H)]
+    for dy in range(hero.h):
+        for dx in range(hero.w):
+            occupied[hero.y+dy][hero.x+dx] = True
+
+    # 随机放置其他方块（严格边界 + 重叠检查）
+    for (w,h,count) in extra_shapes:
+        for _ in range(count):
+            placed = False
+            tries = 0
+            while not placed and tries < 200:
+                x = random.randint(0, W-w)
+                y = random.randint(0, H-h)
+                if x + w > W or y + h > H:
+                    tries += 1
+                    continue
+                overlap = False
+                for yy in range(h):
+                    for xx in range(w):
+                        if occupied[y+yy][x+xx]:
+                            overlap = True
+                            break
+                    if overlap:
+                        break
+                if not overlap:
+                    for yy in range(h):
+                        for xx in range(w):
+                            occupied[y+yy][x+xx] = True
+                    pieces.append(Piece(w,h,x,y))
+                    placed = True
+                tries += 1
+
+    return State(tuple(pieces)), (gx, gy)
+
+def scramble_from_goal(board, goal_state, steps=50):
+    """从终局正向随机走 steps 步，禁止直接回退。"""
+    s = goal_state
+    prev = None
+    for _ in range(steps):
+        moves = board.legal_moves(s)
+        if not moves:
+            break
+        if prev is not None:
+            inv = (prev[0], -prev[1], -prev[2])  # 撤销上一步的动作
+            moves = [m for m in moves if m != inv]
+            if not moves:
+                break
+        mv = random.choice(moves)
+        s = board.apply_move(s, mv)  # 注意：正向应用 mv（不再取反）
+        prev = mv
+    return s
+
+def validate_state(board, state):
+    errs = []
+    occ = [[-1]*board.W for _ in range(board.H)]
+    for idx, p in enumerate(state.pieces):
+        if p.x < 0 or p.y < 0 or p.x + p.w > board.W or p.y + p.h > board.H:
+            errs.append(f"Piece {idx} OOB: {p}")
+            continue
+        for dy in range(p.h):
+            for dx in range(p.w):
+                y = p.y + dy; x = p.x + dx
+                if occ[y][x] != -1:
+                    errs.append(f"Overlap at {(x,y)} between {occ[y][x]} and {idx}")
+                else:
+                    occ[y][x] = idx
+    return errs
+
+# --------- 序列化 / 反序列化（含 Board 和 State）---------
+
+def _dump_block(board, state, name=None):
+    lines = []
+    if name:
+        lines.append(f"NAME {name}")
+    gw, gh = (-1, -1)
+    gx, gy = (-1, -1)
+    if board.goal_piece is not None:
+        gw, gh = board.goal_piece
+    if board.goal_pos is not None:
+        gx, gy = board.goal_pos
+    lines.append(f"BOARD {board.W} {board.H}")
+    lines.append(f"GOAL {gw} {gh} {gx} {gy}")
+    lines.append(f"PIECES {len(state.pieces)}")
+    for p in state.pieces:
+        lines.append(f"{p.w} {p.h} {p.x} {p.y}")
+    lines.append("")  # 空行分隔
+    return "\n".join(lines)
+
+def save_board_state_append(filename, board, state, name=None, cost=None):
+    """
+    追加保存一个 (board, state) 到文件，并写入 COST。
+    若文件不存在则创建并写入 N=1；存在则将首行 N+1，并在文件末尾追加。
+    cost 由调用方传入；若为 None，则写 COST -1。
+    """
+    lines = []
+    if name:
+        lines.append(f"NAME {name}")
+    gw, gh = (-1, -1)
+    gx, gy = (-1, -1)
+    if board.goal_piece is not None:
+        gw, gh = board.goal_piece
+    if board.goal_pos is not None:
+        gx, gy = board.goal_pos
+    lines.append(f"BOARD {board.W} {board.H}")
+    lines.append(f"GOAL {gw} {gh} {gx} {gy}")
+    lines.append(f"PIECES {len(state.pieces)}")
+    for p in state.pieces:
+        lines.append(f"{p.w} {p.h} {p.x} {p.y}")
+    lines.append(f"COST {cost if cost is not None else -1}")
+    lines.append("")  # 空行分隔
+
+    block = "\n".join(lines)
+
+    if not os.path.exists(filename):
+        with open(filename, "w") as f:
+            f.write("1\n")
+            f.write(block + "\n")
+        print(f"新建 {filename} 并保存 1 个条目")
+    else:
+        with open(filename, "r") as f:
+            lines = f.readlines()
+        if not lines:
+            n = 0
+        else:
+            try:
+                n = int(lines[0].strip())
+            except:
+                n = 0
+        lines[0] = str(n+1) + "\n"
+        with open(filename, "w") as f:
+            f.writelines(lines)
+            f.write(block + "\n")
+        print(f"已追加到 {filename}，现在共有 {n+1} 个条目")
+
+def load_board_states(filename):
+    """
+    读取文件，返回 [(Board, State, name_or_None), ...]
+    可容忍空行与可选 NAME。
+    """
+    with open(filename, "r") as f:
+        raw = [ln.rstrip("\n") for ln in f]
+
+    if not raw:
+        return []
+
+    # 读取首行 N（容错：即使不准，也按块解析到 EOF）
+    try:
+        total = int(raw[0].strip())
+    except:
+        total = None
+    i = 1
+    results = []
+
+    def skip_blank(ix):
+        while ix < len(raw) and raw[ix].strip() == "":
+            ix += 1
+        return ix
+
+    while True:
+        i = skip_blank(i)
+        if i >= len(raw):
+            break
+
+        # 可选 NAME
+        name = None
+        if raw[i].startswith("NAME "):
+            name = raw[i][5:].strip()
+            i += 1
+
+        # BOARD
+        if i >= len(raw) or not raw[i].startswith("BOARD "):
+            # 结束或格式异常，跳出
+            break
+        parts = raw[i].split()
+        if len(parts) != 3:
+            break
+        W, H = int(parts[1]), int(parts[2])
+        i += 1
+
+        # GOAL
+        if i >= len(raw) or not raw[i].startswith("GOAL "):
+            break
+        parts = raw[i].split()
+        if len(parts) != 5:
+            break
+        gw, gh, gx, gy = map(int, parts[1:5])
+        goal_piece = None if gw < 0 or gh < 0 else (gw, gh)
+        goal_pos   = None if gx < 0 or gy < 0 else (gx, gy)
+        i += 1
+
+        # PIECES
+        if i >= len(raw) or not raw[i].startswith("PIECES "):
+            break
+        parts = raw[i].split()
+        if len(parts) != 2:
+            break
+        K = int(parts[1])
+        i += 1
+
+        pcs = []
+        ok = True
+        for _ in range(K):
+            if i >= len(raw):
+                ok = False
+                break
+            parts = raw[i].split()
+            if len(parts) != 4:
+                ok = False
+                break
+            w, h, x, y = map(int, parts)
+            pcs.append(Piece(w, h, x, y))
+            i += 1
+        if not ok:
+            break
+
+        # 可选分隔空行
+        i = skip_blank(i)
+
+        b = Board(W, H, goal_piece=goal_piece, goal_pos=goal_pos)
+        s = State(tuple(pcs))
+        results.append((b, s, name))
+
+    print(f"读取 {len(results)} 个条目（文件声明N={total}）")
+    return results
+
+
+# --------- 多核进程 ---------
+def run_one_seed(seed1):
+    random.seed(seed1)
+    width, height = 4, 5
+
+    results = []
+    for idx, cfg in enumerate(configs, start=1):
+        goal_state, (gx, gy) = random_goal_with_blocks(
+            W=width, H=height,
+            hero_size=cfg["hero"],
+            extra_shapes=cfg["extras"]
+        )
+        board = Board(width, height, goal_piece=cfg["hero"], goal_pos=(gx, gy))
+        start = scramble_from_goal(board, goal_state, steps=842000)  # 你的设置
+
+        # 第一次：粗筛（aggressive_h）
+        fast_result = astar(board, start, aggressive_h, max_steps=3500000)
+
+        # 第二次：如果 fast 无解 或 fast_cost > 30，用 blocking_h 求最优
+        true_result = None
+        if fast_result["cost"] is None or fast_result["cost"] > 30:
+            true_result = astar(board, start, blocking_h, max_steps=80500000)
+
+        results.append({
+            "seed": seed1,
+            "config_id": idx,
+            "hero": cfg["hero"],
+            "board": board,
+            "start": start,
+            "fast_result": fast_result,
+            "true_result": true_result,
+        })
+
+    return results
+
+
+
+# ----------------------------
+# 主程序
+# ----------------------------
+if __name__ == "__main__":
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"klotski_run_log_{timestamp}.txt"
+    save_filename = f"klotski_levels_30_{timestamp}.txt"
+
+    seeds = list(range(42, 1987))   # 可以调大 1987
+    saved = 0
+
+    with open(log_filename, "w", encoding="utf-8") as log_file:
+        with Pool(processes=8) as pool:
+            for rlist in tqdm(pool.imap_unordered(run_one_seed, seeds), total=len(seeds)):
+                for r in rlist:
+                    seed1 = r["seed"]
+                    cfg_id = r["config_id"]
+                    hero = r["hero"]
+                    fast = r["fast_result"]
+                    true = r["true_result"]
+
+                    log_file.write(f"\n===== Seed {seed1} Config {cfg_id} Hero={hero} =====\n")
+                    log_file.write(
+                        f"粗筛: cost={fast['cost']}, expanded={fast['expanded']}, "
+                        f"time={fast['time']:.2f}s\n"
+                    )
+
+                    # 如果 fast_cost ≤ 30 → 直接丢弃，不跑第二遍
+                    if fast["cost"] is not None and fast["cost"] <= 30:
+                        log_file.write("❌ fast_cost ≤ 30，丢弃\n")
+                        continue
+
+                    # 第二遍结果
+                    true_cost = true["cost"]
+                    log_file.write(
+                        f"最优A*: cost={true_cost}, expanded={true['expanded']}, "
+                        f"time={true['time']:.2f}s\n"
+                    )
+
+                    # 保存规则：true_cost is None 或 >30 → 保存；≤30 → 丢弃
+                    if (true_cost is None) or (true_cost > 30):
+                        log_file.write(
+                            f"✅ 保存 Seed {seed1} Config {cfg_id}, "
+                            f"cost={'None' if true_cost is None else true_cost}\n"
+                        )
+                        save_board_state_append(
+                            save_filename,
+                            r["board"],
+                            r["start"],
+                            name=f"{seed1}_cfg{cfg_id}",
+                            cost=true_cost
+                        )
+                        saved += 1
+                    else:
+                        log_file.write(
+                            f"❌ 丢弃 Seed {seed1} Config {cfg_id}, cost={true_cost} ≤ 30\n"
+                        )
+
+        log_file.write(
+            f"\n=== 处理完毕: 共 {len(seeds)} 个种子，保存 {saved} 个局面 ===\n"
+        )
+
+    print(f"\n📄 日志已保存到 {log_filename}")
+    print(f"📄 局面已保存到 {save_filename}")

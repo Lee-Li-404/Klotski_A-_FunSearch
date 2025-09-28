@@ -1,0 +1,31 @@
+if __name__ == "__main__":
+    for seed1 in range(1000, 2000, 133):
+        print(f"\n===== Seed {seed1} =====")
+        random.seed(seed1)
+
+        goal_state, (gx,gy) = random_goal_with_blocks(
+            W=4, H=5, hero_size=(2,2),
+            extra_shapes=[(1,2,4), (1,1,4), (2,1,1)]
+        )
+        board = Board(4, 5, goal_piece=(2,2), goal_pos=(gx,gy))
+        start = scramble_from_goal(board, goal_state, steps=21000)
+
+        action = visualize_state_with_save(board, start, name=str(seed1))
+        if action == "discard":
+            print(f"跳过 Seed {seed1}")
+            continue
+        elif action is None:
+            print("用户退出程序")
+            break
+
+        print("初始局面：")
+        print(render_ascii(board, start))
+
+        result = astar(board, start, trivial_h, max_steps=500000)
+        print("\nA* 结果：")
+        print("cost:", result["cost"])
+        print("expanded:", result["expanded"])
+        print("time:", result["time"], "s")
+
+        if result["path"]:
+            visualize_path(board, result["path"], delay=600)
